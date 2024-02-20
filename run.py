@@ -1,53 +1,75 @@
 import requests
-import os.path
-#import json
+import os
+import app_cfg
+# import json
 
-api_psychologia = "euf90cd52e900a4245196929cc6037b2a34aea3d64"
-api_ah200 = "eu0970f0e5d774d09189ec5030af8dfd82e6e942dd"
-api_ah500 = "eu21245290f97d71d0bb9323d97f0eb79b50b9f4fc"
-api_ah1550 = "eu2dbda1d93d854803d4d4872415b342a89ecd8919"
-api_ah5100 = "euea89422400467515f5fc5815701100d1a39e58e4"
-apikeys=[api_psychologia, api_ah200, api_ah500, api_ah1550, api_ah5100]
+apikeys = app_cfg.apikeys
+account_names = app_cfg.account_names
 
-for apikey in apikeys:
-    headers = { 'X-Api-Key' : apikey }
+for apikey, account_name in zip(apikeys, account_names):
+    headers = {'X-Api-Key': apikey}
     response = requests.get('https://api.clickmeeting.com/v1/conferences/active', headers=headers)
-# sprawdza czy połączneie z api dzisiała
-    print(response.status_code)
-# print(response.json())
-    data = response.json()
-    for item in data:
-        # print(item["id"])
-        rec_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings', headers=headers)
-        rec_data = rec_response.json()
-        # print(rec_response.json())
-        for rec in rec_data:
-            rec_id = rec["id"]
-            rec_url = rec["recording_url"]
-            rec_started = rec["recorder_started"]
-            rec_name = item["name"]
-            spec_char=['/','\\','*','\t']
-            for i in spec_char:
-                rec_name=rec_name.replace(i,"-")
-            if rec_id:
-                print(rec_id, rec_url, rec_started, rec_name)
-                response = requests.get(rec_url)
-                rec_started_split = rec_started.split(sep=" ")
-                rec_date = rec_started_split[0]
-                winter_time_mod = 1
-                rec_time_split = rec_started_split[1].split(sep=":")
-                rec_time_h = int(rec_time_split[0]) + winter_time_mod
-                rec_time_m = rec_time_split[1]
-                rec_time_s = rec_time_split[2]
-                new_rec_time = str(str(rec_time_h) + '_' + rec_time_m + '_' + rec_time_s)
-                file_to_save_as = f'{rec_name} {rec_date} {new_rec_time}.mp4'
-                with open(file_to_save_as, "wb") as f:
-                    f.write(response.content)
-                    path = f'./{file_to_save_as}'
-                    checkfile = os.path.exists(path)
-                    if checkfile:
-                        print('Download Completed')
-                        rec_del_resp = requests.delete(f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings/{rec_id}', headers=headers)
-                        print('Record Deleted')
-                    else:
-                        print("Download failed")
+    # sprawdza czy połączneie z api dzisiała
+    if response.status_code == 200:
+        response_translation = " (ok)"
+        print('status code=' + str(response.status_code) + response_translation + ' for account: ' + account_name)
+        data = response.json()
+        for item in data:
+            # print(item["id"])
+            rec_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings',
+                                        headers=headers)
+            rec_data = rec_response.json()
+            # print(rec_response.json())
+            for rec in rec_data:
+                rec_id = rec["id"]
+                rec_url = rec["recording_url"]
+                rec_started = rec["recorder_started"]
+                rec_name = item["name"]
+                rec_file_size = rec["recording_file_size"]
+                spec_char = ['/', '\\', '*', '\t']
+                for i in spec_char:
+                    rec_name = rec_name.replace(i, "-")
+                if rec_id:
+                    print(rec_id, rec_url, rec_started, rec_name, "original file size:" + rec_file_size)
+                    response = requests.get(rec_url)
+                    rec_started_split = rec_started.split(sep=" ")
+                    rec_date = rec_started_split[0]
+                    print(rec_date)
+                    winter_time_mod = 1
+                    rec_time_split = rec_started_split[1].split(sep=":")
+                    rec_time_h = int(rec_time_split[0]) + winter_time_mod
+                    rec_time_m = rec_time_split[1]
+                    rec_time_s = rec_time_split[2]
+                    new_rec_time = str(str(rec_time_h).zfill(2) + '_' + rec_time_m + '_' + rec_time_s)
+                    file_to_save_as = f'{rec_name} {rec_date} {new_rec_time}.mp4'
+                    path_to_save_as = app_cfg.path_to_save
+                    rec_dir = rec_date.replace("-", "_")
+                    print(rec_dir)
+                    if not os.path.isdir(os.path.join(path_to_save_as,rec_dir)):
+                        os.mkdir(os.path.join(path_to_save_as,rec_dir))
+                    path = os.path.join(path_to_save_as,rec_dir,file_to_save_as)
+                    with open(path, "wb") as f:
+                        f.write(response.content)
+                        # path = f'{file_to_save_as}'
+                        checkfile = os.path.exists(path)
+                        file_stats = os.stat(path)
+                        file_size = file_stats.st_size
+                        print(file_size)
+                        if int(rec_file_size) == int(file_size):
+                            if checkfile:
+                                print('Download Completed')
+                                #rec_del_resp = requests.delete(
+                                #    f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings/{rec_id}',
+                                #    headers=headers)
+                                #if rec_del_resp:
+                                #    print('Record Deleted')
+                                #else:
+                                #    print('--- ERROR: Unable to delete record ---')
+                                print("--- Testing... - delete skipped ---")
+                            else:
+                                print('--- ERROR: Download failed. wrong file name---')
+                        else:
+                            print('--- ERROR: Download failed, file size mismatch ---')
+    else:
+        response_translation = " (API not Responding !!!)"
+        print('status code=' + str(response.status_code) + response_translation + ' for account: ' + account_name)
