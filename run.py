@@ -73,3 +73,5 @@ for apikey, account_name in zip(apikeys, account_names):
     else:
         response_translation = " (API not Responding !!!)"
         print('status code=' + str(response.status_code) + response_translation + ' for account: ' + account_name)
+print('Job done!')
+print('If you find this script useful, you can express your gratitude by supporting me with a coffee at https://www.buymeacoffee.com/slawciod82')
