@@ -4,8 +4,11 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a3ba75ff-5abd-4f1a-8b37-f27d8288a913" name="Changes" comment="cm menago 001">
+    <list default="true" id="a3ba75ff-5abd-4f1a-8b37-f27d8288a913" name="Changes" comment="cm menago 002">
+      <change afterPath="$PROJECT_DIR$/readme.txt" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/run.p_" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app_cfg.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/run.py" beforeDir="false" afterPath="$PROJECT_DIR$/run.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -37,6 +40,8 @@
     "Python.run.executor": "Run",
     "RunOnceActivity.OpenProjectViewOnStart": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "master",
     "last_opened_file_path": "/home/osboxes/PycharmProjects/CMAPITEST"
   }
 }]]></component>
@@ -72,7 +77,7 @@
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
-        <option value="bundled-python-sdk-50da183f06c8-d3b881c8e49f-com.jetbrains.pycharm.community.sharedIndexes.bundled-PC-233.13135.95" />
+        <option value="bundled-python-sdk-1b1018131e27-aa17d162503b-com.jetbrains.pycharm.community.sharedIndexes.bundled-PC-243.22562.180" />
       </set>
     </attachedChunks>
   </component>
@@ -109,12 +114,44 @@
       <option name="project" value="LOCAL" />
       <updated>1704896217300</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="cm menago 001">
+      <option name="closed" value="true" />
+      <created>1704896255989</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1704896255989</updated>
+    </task>
+    <task id="LOCAL-00005" summary="cm menago 001">
+      <option name="closed" value="true" />
+      <created>1704896304185</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1704896304185</updated>
+    </task>
+    <task id="LOCAL-00006" summary="cm menago 001">
+      <option name="closed" value="true" />
+      <created>1708438927277</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1708438927277</updated>
+    </task>
+    <task id="LOCAL-00007" summary="cm menago 002">
+      <option name="closed" value="true" />
+      <created>1708438966340</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1708438966340</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
-    <MESSAGE value="cm menago 002" />
     <MESSAGE value="cm menago 001" />
-    <option name="LAST_COMMIT_MESSAGE" value="cm menago 001" />
+    <MESSAGE value="cm menago 002" />
+    <option name="LAST_COMMIT_MESSAGE" value="cm menago 002" />
   </component>
 </project>
