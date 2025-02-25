@@ -23,24 +23,7 @@ for apikey, account_name in zip(apikeys, account_names):
             print(f'room id: {room["id"]}')
             rec_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{room["id"]}/recordings',
                                         headers=headers)
-            sessions_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{room["id"]}/sessions',
-                                        headers=headers)
-            sessions_data = sessions_response.json()
             rec_data = rec_response.json()
-            print(f'sessions_data: {sessions_data}')
-
-            for session in sessions_data:
-                print(f'session: {session}')
-                session_id = session["id"]
-                generate_pdf_url_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{room["id"]}/sessions/{session_id}/generate-pdf/pl', headers=headers)
-                generate_pdf_url_data = generate_pdf_url_response.json()
-                pdf_url = generate_pdf_url_data["url"]
-                response = requests.get(pdf_url)
-                pdf_to_save_as = f'raport - {room["name"]}.pdf'
-                with open(path, "wb") as f:
-                    f.write(response.content)
-                    path = f'{pdf_to_save_as}'
-                    print(f'{path} saved')
             # print(rec_response.json())
             for rec in rec_data:
                 rec_id = rec["id"]
@@ -48,6 +31,27 @@ for apikey, account_name in zip(apikeys, account_names):
                 rec_started = rec["recorder_started"]
                 rec_name = room["name"]
                 rec_file_size = rec["recording_file_size"]
+
+                sessions_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{room["id"]}/sessions',
+                                                 headers=headers)
+                sessions_data = sessions_response.json()
+
+                print(f'sessions_data: {sessions_data}')
+
+                for session in sessions_data:
+                    print(f'session: {session}')
+                    session_id = session["id"]
+                    generate_pdf_url_response = requests.get(
+                        f'https://api.clickmeeting.com/v1/conferences/{room["id"]}/sessions/{session_id}/generate-pdf/pl',
+                        headers=headers)
+                    generate_pdf_url_data = generate_pdf_url_response.json()
+                    pdf_url = generate_pdf_url_data["url"]
+                    response = requests.get(pdf_url)
+                    pdf_to_save_as = f'raport - {room["name"]}.pdf'
+                    with open(path, "wb") as f:
+                        f.write(response.content)
+                        path = f'{pdf_to_save_as}'
+                        print(f'{path} saved')
                 if int(rec_file_size) <= app_cfg.download_limit:
                     print(f'--- File size = {rec_file_size} is lower then download limit (download limit = {app_cfg.download_limit})! ---')
                     # rec_del_resp = requests.delete(f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings/{rec_id}', headers=headers)
