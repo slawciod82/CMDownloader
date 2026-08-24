@@ -168,26 +168,28 @@ def config():
     account_workers = int(
         os.getenv("CM_ACCOUNT_WORKERS", getattr(app_cfg, "account_workers", 1))
     )
-    if "CM_MAX_DOWNLOAD_WORKERS" in os.environ:
-        recording_workers_default = int(os.environ["CM_MAX_DOWNLOAD_WORKERS"])
-    else:
-        recording_workers_default = int(
+    recording_workers_default = int(
+        getattr(
+            app_cfg,
+            "recording_workers_default",
             getattr(
                 app_cfg,
-                "recording_workers_default",
-                getattr(
-                    app_cfg,
-                    "max_download_workers",
-                    getattr(app_cfg, "recording_workers", 2),
-                ),
-            )
+                "max_download_workers",
+                getattr(app_cfg, "recording_workers", 2),
+            ),
         )
+    )
     recording_workers_per_account = {
         str(name): int(value)
         for name, value in dict(
             getattr(app_cfg, "recording_workers_per_account", {})
         ).items()
     }
+    download_worker_cap = (
+        int(os.environ["CM_MAX_DOWNLOAD_WORKERS"])
+        if "CM_MAX_DOWNLOAD_WORKERS" in os.environ
+        else None
+    )
 
     if interval < 1:
         raise ValueError("scheduler interval must be >= 1 second")
@@ -201,11 +203,23 @@ def config():
         raise ValueError("account_workers must be between 1 and 16")
     if not 1 <= recording_workers_default <= 32:
         raise ValueError("recording_workers_default must be between 1 and 32")
+    if download_worker_cap is not None and not 1 <= download_worker_cap <= 32:
+        raise ValueError("CM_MAX_DOWNLOAD_WORKERS must be between 1 and 32")
     for account_name, workers in recording_workers_per_account.items():
         if not 1 <= workers <= 32:
             raise ValueError(
                 f"recording worker limit for {account_name} must be between 1 and 32"
             )
+
+    if download_worker_cap is not None:
+        recording_workers_default = min(
+            recording_workers_default,
+            download_worker_cap,
+        )
+        recording_workers_per_account = {
+            name: min(workers, download_worker_cap)
+            for name, workers in recording_workers_per_account.items()
+        }
 
     return {
         "accounts": list(zip(apikeys, names)),
