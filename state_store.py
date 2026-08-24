@@ -156,7 +156,12 @@ class StateStore:
                 row.recording_name = recording_name
                 row.recorded_at = recorded_at
                 row.expected_size = expected_size
-            return {"id": row.id, "status": row.status, "local_path": row.local_path}
+            return {
+                "id": row.id,
+                "status": row.status,
+                "local_path": row.local_path,
+                "resolution": row.resolution,
+            }
 
     def reconcile_account(self, account_id: int, remote_ids: set[str]) -> None:
         now = utc_now_naive()
@@ -178,6 +183,14 @@ class StateStore:
                     message = (
                         "Recording disappeared from ClickMeeting while quarantined. "
                         "Manual/external handling inferred."
+                    )
+                elif row.resolution == "discarded_short_recording":
+                    row.status = "COMPLETED"
+                    row.resolution = "discarded_short_recording"
+                    event_type = "DISCARDED_SHORT_RECORDING"
+                    message = (
+                        "Short recording previously selected for automatic discard is no "
+                        "longer present in ClickMeeting. No local copy was expected."
                     )
                 else:
                     row.status = "COMPLETED_MANUAL_DELETE"
@@ -270,6 +283,7 @@ class StateStore:
             first_failure = row.status != "DELETE_FAILED"
             row.status = "DELETE_FAILED"
             row.attention_required = True
+            row.resolution = None
             row.local_path = local_path
             row.last_error = message
             row.last_attempt_at = now
@@ -285,6 +299,62 @@ class StateStore:
                         created_at=now,
                     )
                 )
+
+    def mark_discard_delete_failed(self, recording_pk: int, message: str) -> None:
+        now = utc_now_naive()
+        with self._lock, self.Session.begin() as session:
+            row = session.get(Recording, recording_pk)
+            if row is None:
+                return
+            first_failure = not (
+                row.status == "DELETE_FAILED"
+                and row.resolution == "discarded_short_recording"
+            )
+            row.status = "DELETE_FAILED"
+            row.attention_required = True
+            row.resolution = "discarded_short_recording"
+            row.local_path = None
+            row.last_error = message
+            row.last_attempt_at = now
+            if first_failure:
+                session.add(
+                    Event(
+                        recording_id=recording_pk,
+                        event_type="DELETE_FAILED",
+                        message=(
+                            "Short recording matched download_limit, but ClickMeeting "
+                            "deletion failed. No local copy is expected; remote deletion "
+                            "will be retried."
+                        ),
+                        created_at=now,
+                    )
+                )
+
+    def mark_discarded(self, recording_pk: int, message: str | None = None) -> None:
+        now = utc_now_naive()
+        with self._lock, self.Session.begin() as session:
+            row = session.get(Recording, recording_pk)
+            if row is None:
+                return
+            row.status = "COMPLETED"
+            row.attention_required = False
+            row.resolution = "discarded_short_recording"
+            row.local_path = None
+            row.last_error = None
+            row.completed_at = now
+            row.last_attempt_at = now
+            session.add(
+                Event(
+                    recording_id=recording_pk,
+                    event_type="DISCARDED_SHORT_RECORDING",
+                    message=message
+                    or (
+                        "Recording was at or below the configured download_limit and was "
+                        "intentionally deleted from ClickMeeting without downloading."
+                    ),
+                    created_at=now,
+                )
+            )
 
     def mark_completed(
         self,
