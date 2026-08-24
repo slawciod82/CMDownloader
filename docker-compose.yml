@@ -3,11 +3,10 @@ services:
     build: .
     environment:
       CM_STATE_DATABASE_PATH: /state/cm_downloader.db
-      CM_RECORDINGS_PATH: /recordings
     volumes:
       - ./app_cfg.py:/app/app_cfg.py:ro
       - ${CM_STATE_DIR:-./state}:/state
-      - ${CM_RECORDINGS_DIR:?Set CM_RECORDINGS_DIR to the host recordings directory}:/recordings
+      - /UPLOAD:/UPLOAD
     read_only: true
     tmpfs:
       - /tmp
