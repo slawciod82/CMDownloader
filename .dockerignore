@@ -1,0 +1,10 @@
+.git
+.gitignore
+app_cfg.py
+state/
+__pycache__/
+*.pyc
+*.db
+*.db-*
+*.part
+.env
