@@ -247,12 +247,187 @@ def heartbeat_loop(store, stop_event):
             line(f"{RED}--- ERROR: heartbeat update failed: {exc} ---{RESET}")
 
 
+def _get_json_list(url, headers, timeout):
+    response = requests.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError(f"Expected list response from {url}")
+    return response, data
+
+
+def _room_name_map(rooms):
+    names = {}
+    for room in rooms:
+        if not isinstance(room, dict) or room.get("id") is None:
+            continue
+        room_id = str(room["id"])
+        names[room_id] = str(room.get("name") or f"room_{room_id}")
+    return names
+
+
+def _with_room_context(raw, conference_id, room_name):
+    item = dict(raw)
+    item["_conference_id"] = str(conference_id)
+    item["_room_name"] = str(room_name)
+    return item
+
+
+def discover_recordings(headers, cfg, account_name):
+    timeout = cfg["request_timeout"]
+    global_recordings = None
+
+    try:
+        response, global_recordings = _get_json_list(
+            f"{API_BASE_URL}/conferences/recordings",
+            headers,
+            timeout,
+        )
+        line(
+            f"[{account_name}] Global recordings endpoint: "
+            f"HTTP {response.status_code}, found {len(global_recordings)}"
+        )
+    except (requests.RequestException, ValueError) as exc:
+        line(
+            f"{YELLOW}[{account_name}] Global recordings endpoint failed: {exc}. "
+            f"Using active-room fallback.{RESET}"
+        )
+
+    if global_recordings:
+        rooms = None
+        room_names = {}
+        try:
+            _, rooms = _get_json_list(
+                f"{API_BASE_URL}/conferences/active",
+                headers,
+                timeout,
+            )
+            room_names = _room_name_map(rooms)
+        except (requests.RequestException, ValueError) as exc:
+            line(
+                f"{YELLOW}[{account_name}] Room-name lookup failed: {exc}. "
+                f"Using room_<id> fallback names.{RESET}"
+            )
+
+        normalized = []
+        unresolved = []
+        for raw in global_recordings:
+            if not isinstance(raw, dict):
+                normalized.append(raw)
+                continue
+            conference_id = raw.get("conference_id") or raw.get("room_id")
+            if conference_id is None:
+                unresolved.append(raw)
+                continue
+            room_id = str(conference_id)
+            normalized.append(
+                _with_room_context(
+                    raw,
+                    room_id,
+                    room_names.get(room_id, f"room_{room_id}"),
+                )
+            )
+
+        if unresolved:
+            if rooms is None:
+                _, rooms = _get_json_list(
+                    f"{API_BASE_URL}/conferences/active",
+                    headers,
+                    timeout,
+                )
+                room_names = _room_name_map(rooms)
+
+            unresolved_by_id = {
+                str(raw["id"]): raw
+                for raw in unresolved
+                if isinstance(raw, dict) and raw.get("id") is not None
+            }
+            unresolved_without_id = [
+                raw
+                for raw in unresolved
+                if not isinstance(raw, dict) or raw.get("id") is None
+            ]
+
+            for room in rooms:
+                if not unresolved_by_id:
+                    break
+                if not isinstance(room, dict) or room.get("id") is None:
+                    continue
+                room_id = str(room["id"])
+                room_name = room_names.get(room_id, f"room_{room_id}")
+                _, per_room = _get_json_list(
+                    f"{API_BASE_URL}/conferences/{room_id}/recordings",
+                    headers,
+                    timeout,
+                )
+                for per_room_raw in per_room:
+                    if not isinstance(per_room_raw, dict):
+                        continue
+                    recording_id = str(per_room_raw.get("id"))
+                    source = unresolved_by_id.pop(recording_id, None)
+                    if source is None:
+                        continue
+                    merged = dict(source)
+                    merged.update(per_room_raw)
+                    normalized.append(
+                        _with_room_context(merged, room_id, room_name)
+                    )
+
+            normalized.extend(unresolved_by_id.values())
+            normalized.extend(unresolved_without_id)
+
+        return normalized, "global"
+
+    line(f"[{account_name}] Using active -> per-room recordings fallback.")
+    _, rooms = _get_json_list(
+        f"{API_BASE_URL}/conferences/active",
+        headers,
+        timeout,
+    )
+    room_names = _room_name_map(rooms)
+    normalized = []
+
+    for room in rooms:
+        if not isinstance(room, dict) or room.get("id") is None:
+            continue
+        room_id = str(room["id"])
+        room_name = room_names.get(room_id, f"room_{room_id}")
+        _, per_room = _get_json_list(
+            f"{API_BASE_URL}/conferences/{room_id}/recordings",
+            headers,
+            timeout,
+        )
+        for raw in per_room:
+            if isinstance(raw, dict):
+                normalized.append(_with_room_context(raw, room_id, room_name))
+            else:
+                normalized.append(raw)
+
+    return normalized, "active/per-room"
+
+
 def parse_recording(raw, account_name, headers, account_id, store):
     remote_id = str(raw["id"])
-    conference_id = str(raw["conference_id"])
-    name = str(raw.get("recording_name") or f"recording_{remote_id}")
+    conference_value = (
+        raw.get("_conference_id")
+        or raw.get("conference_id")
+        or raw.get("room_id")
+    )
+    if conference_value is None:
+        raise ValueError(f"recording {remote_id} has no conference_id/room_id")
+    conference_id = str(conference_value)
+
+    name = str(
+        raw.get("_room_name")
+        or raw.get("room_name")
+        or raw.get("recording_name")
+        or f"room_{conference_id}"
+    )
     size = int(raw["recording_file_size"])
-    started = datetime.fromisoformat(str(raw["recorder_start_date"]))
+    started_value = raw.get("recorder_started") or raw.get("recorder_start_date")
+    if not started_value:
+        raise ValueError(f"recording {remote_id} has no recorder start timestamp")
+    started = datetime.fromisoformat(str(started_value))
     if started.tzinfo is None:
         started = started.replace(tzinfo=timezone.utc)
 
@@ -270,7 +445,7 @@ def parse_recording(raw, account_name, headers, account_id, store):
         headers=headers,
         recording_id=remote_id,
         conference_id=conference_id,
-        recording_url=str(raw["recording_url"]),
+        recording_url=str(raw.get("recording_url") or ""),
         recording_name=name,
         local_started=started.astimezone(LOCAL_TIMEZONE),
         expected_size=size,
@@ -552,23 +727,18 @@ def process_account(store, run_id, cfg, number, apikey, account_name):
     line("Connecting to ClickMeeting API...")
 
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/conferences/recordings",
-            headers=headers,
-            timeout=cfg["request_timeout"],
+        raw_recordings, discovery_mode = discover_recordings(
+            headers,
+            cfg,
+            account_name,
         )
-        response.raise_for_status()
-        raw_recordings = response.json()
-        if not isinstance(raw_recordings, list):
-            raise ValueError("recordings response is not a list")
     except (requests.RequestException, ValueError) as exc:
         line(f"{RED}--- ERROR: API request failed for {account_name}: {exc} ---{RESET}")
         return AccountResult(failed=1)
 
     found = len(raw_recordings)
     failed = downloaded = 0
-    line(f"status code={response.status_code} (ok) for account: {account_name}")
-    line(f"Recordings found: {found}")
+    line(f"[{account_name}] Recordings found: {found} ({discovery_mode})")
     remote_ids = {
         str(item["id"])
         for item in raw_recordings
