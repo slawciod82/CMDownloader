@@ -293,7 +293,7 @@ def discover_recordings(headers, cfg, account_name):
             f"Using active-room fallback.{RESET}"
         )
 
-    if global_recordings:
+    if global_recordings is not None:
         rooms = None
         room_names = {}
         try:
