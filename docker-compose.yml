@@ -3,6 +3,8 @@ services:
     build: .
     environment:
       CM_STATE_DATABASE_PATH: /state/cm_downloader.db
+      CM_ACCOUNT_WORKERS: ${CM_ACCOUNT_WORKERS:-1}
+      CM_MAX_DOWNLOAD_WORKERS: ${CM_MAX_DOWNLOAD_WORKERS:-1}
     volumes:
       - ./app_cfg.py:/app/app_cfg.py:ro
       - ${CM_STATE_DIR:-./state}:/state
