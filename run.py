@@ -1,77 +1,122 @@
-import requests
+from datetime import datetime
 import os
+from zoneinfo import ZoneInfo
+
+import requests
+
 import app_cfg
-# import json
+
+
+API_BASE_URL = "https://api.clickmeeting.com/v1"
+LOCAL_TIMEZONE = ZoneInfo("Europe/Warsaw")
+API_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = (30, 300)
+CHUNK_SIZE = 1024 * 1024
+
+
+def sanitize_filename(name):
+    for char in ["/", "\\", "*", "\t"]:
+        name = name.replace(char, "-")
+    return name
+
 
 apikeys = app_cfg.apikeys
 account_names = app_cfg.account_names
 
 for apikey, account_name in zip(apikeys, account_names):
-    headers = {'X-Api-Key': apikey}
-    response = requests.get('https://api.clickmeeting.com/v1/conferences/active', headers=headers)
-    # sprawdza czy połączneie z api dzisiała
-    if response.status_code == 200:
-        response_translation = " (ok)"
-        print('status code=' + str(response.status_code) + response_translation + ' for account: ' + account_name)
-        data = response.json()
-        for item in data:
-            # print(item["id"])
-            rec_response = requests.get(f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings',
-                                        headers=headers)
-            rec_data = rec_response.json()
-            # print(rec_response.json())
-            for rec in rec_data:
-                rec_id = rec["id"]
-                rec_url = rec["recording_url"]
-                rec_started = rec["recorder_started"]
-                rec_name = item["name"]
-                rec_file_size = rec["recording_file_size"]
-                spec_char = ['/', '\\', '*', '\t']
-                for i in spec_char:
-                    rec_name = rec_name.replace(i, "-")
-                if rec_id:
-                    print(rec_id, rec_url, rec_started, rec_name, "original file size:" + rec_file_size)
-                    response = requests.get(rec_url)
-                    rec_started_split = rec_started.split(sep=" ")
-                    rec_date = rec_started_split[0]
-                    print(rec_date)
-                    winter_time_mod = 1
-                    rec_time_split = rec_started_split[1].split(sep=":")
-                    rec_time_h = int(rec_time_split[0]) + winter_time_mod
-                    rec_time_m = rec_time_split[1]
-                    rec_time_s = rec_time_split[2]
-                    new_rec_time = str(str(rec_time_h).zfill(2) + '_' + rec_time_m + '_' + rec_time_s)
-                    file_to_save_as = f'{rec_name} {rec_date} {new_rec_time}.mp4'
-                    path_to_save_as = app_cfg.path_to_save
-                    rec_dir = rec_date.replace("-", "_")
-                    print(rec_dir)
-                    if not os.path.isdir(os.path.join(path_to_save_as,rec_dir)):
-                        os.mkdir(os.path.join(path_to_save_as,rec_dir))
-                    path = os.path.join(path_to_save_as,rec_dir,file_to_save_as)
-                    with open(path, "wb") as f:
-                        f.write(response.content)
-                        # path = f'{file_to_save_as}'
-                        checkfile = os.path.exists(path)
-                        file_stats = os.stat(path)
-                        file_size = file_stats.st_size
-                        print(file_size)
-                        if int(rec_file_size) == int(file_size):
-                            if checkfile:
-                                print('Download Completed')
-                                rec_del_resp = requests.delete(
-                                    f'https://api.clickmeeting.com/v1/conferences/{item["id"]}/recordings/{rec_id}',
-                                    headers=headers)
-                                if rec_del_resp:
-                                    print('Record Deleted')
-                                else:
-                                    print('--- ERROR: Unable to delete record ---')
-                                # print("--- Testing... - delete skipped ---")
-                            else:
-                                print('--- ERROR: Download failed. wrong file name---')
-                        else:
-                            print('--- ERROR: Download failed, file size mismatch ---')
-    else:
-        response_translation = " (API not Responding !!!)"
-        print('status code=' + str(response.status_code) + response_translation + ' for account: ' + account_name)
-print('Job done!')
-print('If you find this script useful, you can express your gratitude by supporting me with a coffee at https://www.buymeacoffee.com/slawciod82')
+    headers = {"X-Api-Key": apikey}
+
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/conferences/recordings",
+            headers=headers,
+            timeout=API_TIMEOUT,
+        )
+        response.raise_for_status()
+        recordings = response.json()
+        print(f"status code={response.status_code} (ok) for account: {account_name}")
+    except (requests.RequestException, ValueError) as exc:
+        print(f"--- ERROR: API request failed for account: {account_name}: {exc} ---")
+        continue
+
+    for rec in recordings:
+        temp_path = None
+        try:
+            rec_id = rec["id"]
+            conference_id = rec["conference_id"]
+            rec_url = rec["recording_url"]
+            rec_started = datetime.fromisoformat(rec["recorder_start_date"])
+            rec_name = sanitize_filename(
+                rec.get("recording_name") or f"recording_{rec_id}"
+            )
+            rec_file_size = int(rec["recording_file_size"])
+
+            local_started = rec_started.astimezone(LOCAL_TIMEZONE)
+            rec_date = local_started.strftime("%Y-%m-%d")
+            rec_time = local_started.strftime("%H_%M_%S")
+            rec_dir = rec_date.replace("-", "_")
+
+            path_to_save_as = app_cfg.path_to_save
+            target_dir = os.path.join(path_to_save_as, rec_dir)
+            os.makedirs(target_dir, exist_ok=True)
+
+            file_to_save_as = f"{rec_name} {rec_date} {rec_time}.mp4"
+            path = os.path.join(target_dir, file_to_save_as)
+            temp_path = f"{path}.part"
+
+            print(
+                rec_id,
+                rec_url,
+                local_started.isoformat(),
+                rec_name,
+                f"original file size:{rec_file_size}",
+            )
+
+            with requests.get(
+                rec_url,
+                stream=True,
+                timeout=DOWNLOAD_TIMEOUT,
+            ) as download_response:
+                download_response.raise_for_status()
+                with open(temp_path, "wb") as file_handle:
+                    for chunk in download_response.iter_content(chunk_size=CHUNK_SIZE):
+                        if chunk:
+                            file_handle.write(chunk)
+
+            file_size = os.path.getsize(temp_path)
+            print(file_size)
+
+            if file_size != rec_file_size:
+                os.remove(temp_path)
+                print("--- ERROR: Download failed, file size mismatch ---")
+                continue
+
+            os.replace(temp_path, path)
+            print("Download Completed")
+
+            rec_del_resp = requests.delete(
+                f"{API_BASE_URL}/conferences/{conference_id}/recordings/{rec_id}",
+                headers=headers,
+                timeout=API_TIMEOUT,
+            )
+            if rec_del_resp.ok:
+                print("Record Deleted")
+            else:
+                print(
+                    "--- ERROR: Unable to delete record "
+                    f"(status code={rec_del_resp.status_code}) ---"
+                )
+
+        except (KeyError, TypeError, ValueError, OSError, requests.RequestException) as exc:
+            print(f"--- ERROR: Recording processing failed: {exc} ---")
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+print("Job done!")
+print(
+    "If you find this script useful, you can express your gratitude by supporting me "
+    "with a coffee at https://www.buymeacoffee.com/slawciod82"
+)
