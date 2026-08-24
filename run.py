@@ -20,11 +20,28 @@ def sanitize_filename(name):
     return name
 
 
+def format_size(size):
+    size = int(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
 apikeys = app_cfg.apikeys
 account_names = app_cfg.account_names
 
-for apikey, account_name in zip(apikeys, account_names):
+print("CMDownloader started")
+print(f"Configured accounts: {len(list(zip(apikeys, account_names)))}")
+
+for account_number, (apikey, account_name) in enumerate(
+    zip(apikeys, account_names), start=1
+):
     headers = {"X-Api-Key": apikey}
+    print()
+    print("=" * 70)
+    print(f"Account {account_number}: {account_name}")
+    print("Connecting to ClickMeeting API...")
 
     try:
         response = requests.get(
@@ -34,13 +51,29 @@ for apikey, account_name in zip(apikeys, account_names):
         )
         response.raise_for_status()
         recordings = response.json()
-        print(f"status code={response.status_code} (ok) for account: {account_name}")
+        print(
+            f"status code={response.status_code} (ok) for account: {account_name}"
+        )
+        print(f"Recordings found: {len(recordings)}")
     except (requests.RequestException, ValueError) as exc:
-        print(f"--- ERROR: API request failed for account: {account_name}: {exc} ---")
+        print(
+            f"--- ERROR: API request failed for account: {account_name}: {exc} ---"
+        )
         continue
 
-    for rec in recordings:
+    if not recordings:
+        print("Nothing to download for this account.")
+        continue
+
+    downloaded_count = 0
+    deleted_count = 0
+
+    for recording_number, rec in enumerate(recordings, start=1):
         temp_path = None
+        print()
+        print("-" * 70)
+        print(f"Recording {recording_number}/{len(recordings)}")
+
         try:
             rec_id = rec["id"]
             conference_id = rec["conference_id"]
@@ -64,13 +97,16 @@ for apikey, account_name in zip(apikeys, account_names):
             path = os.path.join(target_dir, file_to_save_as)
             temp_path = f"{path}.part"
 
-            print(
-                rec_id,
-                rec_url,
-                local_started.isoformat(),
-                rec_name,
-                f"original file size:{rec_file_size}",
-            )
+            print(f"ID: {rec_id}")
+            print(f"Name: {rec_name}")
+            print(f"Recorded: {local_started.isoformat()}")
+            print(f"Original file size: {format_size(rec_file_size)}")
+            print(f"Directory: {target_dir}")
+            print(f"File: {file_to_save_as}")
+            print("Downloading...")
+
+            downloaded_bytes = 0
+            last_reported_percent = -10
 
             with requests.get(
                 rec_url,
@@ -79,20 +115,48 @@ for apikey, account_name in zip(apikeys, account_names):
             ) as download_response:
                 download_response.raise_for_status()
                 with open(temp_path, "wb") as file_handle:
-                    for chunk in download_response.iter_content(chunk_size=CHUNK_SIZE):
-                        if chunk:
-                            file_handle.write(chunk)
+                    for chunk in download_response.iter_content(
+                        chunk_size=CHUNK_SIZE
+                    ):
+                        if not chunk:
+                            continue
+
+                        file_handle.write(chunk)
+                        downloaded_bytes += len(chunk)
+
+                        if rec_file_size > 0:
+                            percent = min(
+                                100,
+                                int(downloaded_bytes * 100 / rec_file_size),
+                            )
+                            report_percent = (percent // 10) * 10
+                            if report_percent > last_reported_percent:
+                                print(
+                                    f"  {report_percent:3d}% "
+                                    f"({format_size(downloaded_bytes)} / "
+                                    f"{format_size(rec_file_size)})"
+                                )
+                                last_reported_percent = report_percent
 
             file_size = os.path.getsize(temp_path)
-            print(file_size)
+            print(
+                "Download finished. "
+                f"Saved {format_size(file_size)}. Verifying file size..."
+            )
 
             if file_size != rec_file_size:
                 os.remove(temp_path)
-                print("--- ERROR: Download failed, file size mismatch ---")
+                print(
+                    "--- ERROR: Download failed, file size mismatch "
+                    f"(expected {rec_file_size}, got {file_size}) ---"
+                )
                 continue
 
             os.replace(temp_path, path)
+            downloaded_count += 1
             print("Download Completed")
+            print("File size verified.")
+            print("Deleting verified recording from ClickMeeting...")
 
             rec_del_resp = requests.delete(
                 f"{API_BASE_URL}/conferences/{conference_id}/recordings/{rec_id}",
@@ -100,6 +164,7 @@ for apikey, account_name in zip(apikeys, account_names):
                 timeout=API_TIMEOUT,
             )
             if rec_del_resp.ok:
+                deleted_count += 1
                 print("Record Deleted")
             else:
                 print(
@@ -107,7 +172,13 @@ for apikey, account_name in zip(apikeys, account_names):
                     f"(status code={rec_del_resp.status_code}) ---"
                 )
 
-        except (KeyError, TypeError, ValueError, OSError, requests.RequestException) as exc:
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            OSError,
+            requests.RequestException,
+        ) as exc:
             print(f"--- ERROR: Recording processing failed: {exc} ---")
             if temp_path and os.path.exists(temp_path):
                 try:
@@ -115,6 +186,15 @@ for apikey, account_name in zip(apikeys, account_names):
                 except OSError:
                     pass
 
+    print()
+    print(
+        f"Account completed: {account_name}. "
+        f"Downloaded: {downloaded_count}/{len(recordings)}, "
+        f"deleted from ClickMeeting: {deleted_count}/{len(recordings)}."
+    )
+
+print()
+print("=" * 70)
 print("Job done!")
 print(
     "If you find this script useful, you can express your gratitude by supporting me "
