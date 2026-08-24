@@ -14,7 +14,11 @@ services:
           fs_type="$$(stat -f -c %T /UPLOAD 2>/dev/null || true)"
           case "$$fs_type" in
             nfs|nfs4) exec python run.py ;;
-            *) echo "ERROR: /UPLOAD must be an NFS mount (found: $${fs_type:-unavailable})." >&2; exit 1 ;;
+            *)
+              echo "ERROR: /UPLOAD must be an NFS mount (found: $${fs_type:-unavailable}). Retrying after container restart." >&2
+              sleep 15
+              exit 1
+              ;;
           esac
     read_only: true
     tmpfs:
