@@ -48,6 +48,7 @@ class RemoteRecording:
     local_started: datetime
     expected_size: int
     current_status: str
+    resolution: str | None
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ def config():
         getattr(app_cfg, "download_backoff", [0, 3, 7, 15]),
         download_retry,
     )
+    download_limit = int(getattr(app_cfg, "download_limit", 0))
 
     account_workers = int(
         os.getenv("CM_ACCOUNT_WORKERS", getattr(app_cfg, "account_workers", 1))
@@ -193,6 +195,8 @@ def config():
         raise ValueError("connect_timeout and read_timeout must be >= 1 second")
     if not 1 <= download_retry <= 16:
         raise ValueError("download_retry must be between 1 and 16")
+    if download_limit < 0:
+        raise ValueError("download_limit must be >= 0")
     if not 1 <= account_workers <= 16:
         raise ValueError("account_workers must be between 1 and 16")
     if not 1 <= recording_workers_default <= 32:
@@ -214,10 +218,10 @@ def config():
         "request_timeout": (connect_timeout, read_timeout),
         "download_retry": download_retry,
         "download_backoff": download_backoff,
+        "download_limit": download_limit,
         "account_workers": min(account_workers, len(apikeys)),
         "recording_workers_default": recording_workers_default,
         "recording_workers_per_account": recording_workers_per_account,
-        "legacy_download_limit": int(getattr(app_cfg, "download_limit", 0)),
     }
 
 
@@ -450,6 +454,7 @@ def parse_recording(raw, account_name, headers, account_id, store):
         local_started=started.astimezone(LOCAL_TIMEZONE),
         expected_size=size,
         current_status=row["status"],
+        resolution=row["resolution"],
     )
 
 
@@ -502,14 +507,43 @@ def delete_remote(recording, timeout):
     return False, f"ClickMeeting DELETE returned HTTP {response.status_code}"
 
 
-def retry_delete(store, recording, cfg):
+def discard_short_recording(store, recording, cfg):
     line(
-        f"Retrying remote delete without redownload: "
-        f"{recording.account_name} / {recording.recording_name}"
+        f"Discarding short recording without download: "
+        f"{recording.account_name} / {recording.recording_name} "
+        f"({format_size(recording.expected_size)} <= "
+        f"{format_size(cfg['download_limit'])})"
     )
     ok, message = delete_remote(recording, cfg["request_timeout"])
     if ok:
-        store.delete_retry_ok(recording.local_id)
+        store.mark_discarded(recording.local_id)
+        line(f"{GREEN}Short recording discarded{RESET}")
+        return 0
+    store.mark_discard_delete_failed(recording.local_id, message)
+    line(f"{RED}--- ERROR: {message} ---{RESET}")
+    return 1
+
+
+def retry_delete(store, recording, cfg):
+    short_discard = recording.resolution == "discarded_short_recording"
+    action = (
+        "Retrying short-recording discard"
+        if short_discard
+        else "Retrying remote delete without redownload"
+    )
+    line(f"{action}: {recording.account_name} / {recording.recording_name}")
+    ok, message = delete_remote(recording, cfg["request_timeout"])
+    if ok:
+        if short_discard:
+            store.mark_discarded(
+                recording.local_id,
+                message=(
+                    "Remote deletion retry completed for a recording at or below "
+                    "download_limit. No local copy was expected."
+                ),
+            )
+        else:
+            store.delete_retry_ok(recording.local_id)
         line(f"{GREEN}Remote delete completed{RESET}")
         return 0
     store.delete_retry_failed(recording.local_id, message)
@@ -768,6 +802,11 @@ def process_account(store, run_id, cfg, number, apikey, account_name):
                 f"Skipping resolved: {recording.recording_name} "
                 f"({recording.current_status})"
             )
+        elif (
+            cfg["download_limit"] > 0
+            and recording.expected_size <= cfg["download_limit"]
+        ):
+            failed += discard_short_recording(store, recording, cfg)
         elif recording.current_status in {"NEW", "RETRYABLE_ERROR", "DOWNLOADING"}:
             queue.append(recording)
         else:
@@ -935,10 +974,12 @@ def main():
                 f"backoff={cfg['download_backoff']}"
             )
             line(f"Run interval: {cfg['interval']}s")
-            if cfg["legacy_download_limit"] > 0:
+            if cfg["download_limit"] > 0:
                 line(
-                    "Legacy download_limit is intentionally not used: "
-                    "small recordings are downloaded and verified before remote deletion."
+                    "Short-recording discard threshold: "
+                    f"{format_size(cfg['download_limit'])} "
+                    f"({cfg['download_limit']} B). Recordings at or below this size "
+                    "are intentionally deleted without downloading."
                 )
 
             heartbeat = threading.Thread(
