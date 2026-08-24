@@ -21,8 +21,6 @@ from state_store import StateStore, utc_now_naive
 
 API_BASE_URL = "https://api.clickmeeting.com/v1"
 LOCAL_TIMEZONE = ZoneInfo("Europe/Warsaw")
-API_TIMEOUT = 30
-DOWNLOAD_TIMEOUT = (30, 300)
 CHUNK_SIZE = 1024 * 1024
 CLI_REFRESH = 0.25
 STATE_REFRESH = 1.0
@@ -58,13 +56,20 @@ class Result:
     failed: int = 0
 
 
+@dataclass(frozen=True)
+class AccountResult:
+    found: int = 0
+    downloaded: int = 0
+    failed: int = 0
+
+
 def line(message=""):
     with PRINT_LOCK:
         print(message, flush=True)
 
 
 def sanitize_filename(name):
-    for char in ["/", "\\", "*", "\t"]:
+    for char in ["/", "\\", "*", "\t", ":"]:
         name = name.replace(char, "-")
     return name
 
@@ -123,6 +128,15 @@ def parse_args():
     return parser.parse_args()
 
 
+def _normalize_backoff(values, attempts):
+    backoff = [int(value) for value in values]
+    if not backoff:
+        backoff = [0]
+    if len(backoff) < attempts:
+        backoff.extend([backoff[-1]] * (attempts - len(backoff)))
+    return backoff[:attempts]
+
+
 def config():
     apikeys = list(app_cfg.apikeys)
     names = list(app_cfg.account_names)
@@ -131,22 +145,63 @@ def config():
     if not apikeys:
         raise ValueError("At least one ClickMeeting account is required")
 
-    interval = int(
-        os.getenv(
-            "CM_RUN_INTERVAL_SECONDS",
-            getattr(app_cfg, "run_interval_seconds", 300),
-        )
+    if "CM_RUN_INTERVAL_SECONDS" in os.environ:
+        interval = int(os.environ["CM_RUN_INTERVAL_SECONDS"])
+    elif hasattr(app_cfg, "run_interval_seconds"):
+        interval = int(app_cfg.run_interval_seconds)
+    else:
+        interval = int(getattr(app_cfg, "scheduler_interval", 5)) * 60
+
+    default_timeout = int(getattr(app_cfg, "timeout", 15))
+    connect_timeout = int(getattr(app_cfg, "connect_timeout", default_timeout))
+    read_timeout = int(
+        getattr(app_cfg, "read_timeout", max(default_timeout * 10, 300))
     )
-    workers = int(
-        os.getenv(
-            "CM_MAX_DOWNLOAD_WORKERS",
-            getattr(app_cfg, "max_download_workers", 2),
-        )
+    download_retry = int(getattr(app_cfg, "download_retry", 4))
+    download_backoff = _normalize_backoff(
+        getattr(app_cfg, "download_backoff", [0, 3, 7, 15]),
+        download_retry,
     )
+
+    account_workers = int(
+        os.getenv("CM_ACCOUNT_WORKERS", getattr(app_cfg, "account_workers", 1))
+    )
+    if "CM_MAX_DOWNLOAD_WORKERS" in os.environ:
+        recording_workers_default = int(os.environ["CM_MAX_DOWNLOAD_WORKERS"])
+    else:
+        recording_workers_default = int(
+            getattr(
+                app_cfg,
+                "recording_workers_default",
+                getattr(
+                    app_cfg,
+                    "max_download_workers",
+                    getattr(app_cfg, "recording_workers", 2),
+                ),
+            )
+        )
+    recording_workers_per_account = {
+        str(name): int(value)
+        for name, value in dict(
+            getattr(app_cfg, "recording_workers_per_account", {})
+        ).items()
+    }
+
     if interval < 1:
-        raise ValueError("run_interval_seconds must be >= 1")
-    if not 1 <= workers <= 16:
-        raise ValueError("max_download_workers must be between 1 and 16")
+        raise ValueError("scheduler interval must be >= 1 second")
+    if connect_timeout < 1 or read_timeout < 1:
+        raise ValueError("connect_timeout and read_timeout must be >= 1 second")
+    if not 1 <= download_retry <= 16:
+        raise ValueError("download_retry must be between 1 and 16")
+    if not 1 <= account_workers <= 16:
+        raise ValueError("account_workers must be between 1 and 16")
+    if not 1 <= recording_workers_default <= 32:
+        raise ValueError("recording_workers_default must be between 1 and 32")
+    for account_name, workers in recording_workers_per_account.items():
+        if not 1 <= workers <= 32:
+            raise ValueError(
+                f"recording worker limit for {account_name} must be between 1 and 32"
+            )
 
     return {
         "accounts": list(zip(apikeys, names)),
@@ -156,7 +211,13 @@ def config():
         ),
         "recordings": os.getenv("CM_RECORDINGS_PATH", app_cfg.path_to_save),
         "interval": interval,
-        "workers": workers,
+        "request_timeout": (connect_timeout, read_timeout),
+        "download_retry": download_retry,
+        "download_backoff": download_backoff,
+        "account_workers": min(account_workers, len(apikeys)),
+        "recording_workers_default": recording_workers_default,
+        "recording_workers_per_account": recording_workers_per_account,
+        "legacy_download_limit": int(getattr(app_cfg, "download_limit", 0)),
     }
 
 
@@ -219,18 +280,42 @@ def parse_recording(raw, account_name, headers, account_id, store):
 
 def target_path(recording, root):
     date = recording.local_started.strftime("%Y-%m-%d")
+    year = recording.local_started.strftime("%Y")
+    month = recording.local_started.strftime("%m")
     time_part = recording.local_started.strftime("%H_%M_%S")
-    directory = date.replace("-", "_")
     filename = f"{sanitize_filename(recording.recording_name)} {date} {time_part}.mp4"
-    return Path(root) / directory / filename
+    return Path(root) / year / month / date / filename
 
 
-def delete_remote(recording):
+def refresh_recording_url(recording, timeout):
+    response = requests.get(
+        f"{API_BASE_URL}/conferences/{recording.conference_id}/recordings",
+        headers=recording.headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    raw_recordings = response.json()
+    if not isinstance(raw_recordings, list):
+        raise ValueError("recordings response is not a list")
+
+    for raw in raw_recordings:
+        if str(raw.get("id")) == recording.recording_id:
+            url = raw.get("recording_url")
+            if url:
+                return str(url)
+            raise ValueError("recording_url is missing")
+    raise ValueError(
+        f"recording {recording.recording_id} is not present in conference "
+        f"{recording.conference_id}"
+    )
+
+
+def delete_remote(recording, timeout):
     try:
         response = requests.delete(
             f"{API_BASE_URL}/conferences/{recording.conference_id}/recordings/{recording.recording_id}",
             headers=recording.headers,
-            timeout=API_TIMEOUT,
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         return False, f"ClickMeeting DELETE request failed: {exc}"
@@ -242,12 +327,12 @@ def delete_remote(recording):
     return False, f"ClickMeeting DELETE returned HTTP {response.status_code}"
 
 
-def retry_delete(store, recording):
+def retry_delete(store, recording, cfg):
     line(
         f"Retrying remote delete without redownload: "
         f"{recording.account_name} / {recording.recording_name}"
     )
-    ok, message = delete_remote(recording)
+    ok, message = delete_remote(recording, cfg["request_timeout"])
     if ok:
         store.delete_retry_ok(recording.local_id)
         line(f"{GREEN}Remote delete completed{RESET}")
@@ -257,9 +342,71 @@ def retry_delete(store, recording):
     return 1
 
 
-def download_one(store, run_id, recording, root, single_worker_cli):
+def _download_attempt(store, worker, recording, part, cfg, single_worker_cli):
+    downloaded = 0
+    speed = 0.0
+    speed_time = state_time = log_time = time.monotonic()
+    speed_bytes = 0
+
+    url = refresh_recording_url(recording, cfg["request_timeout"])
+    if part.exists():
+        part.unlink()
+
+    if single_worker_cli:
+        progress(0, recording.expected_size, 0)
+
+    with requests.get(
+        url,
+        stream=True,
+        timeout=cfg["request_timeout"],
+    ) as response:
+        response.raise_for_status()
+        with open(part, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+
+                if now - speed_time >= CLI_REFRESH:
+                    elapsed = now - speed_time
+                    speed = (downloaded - speed_bytes) / elapsed
+                    speed_time, speed_bytes = now, downloaded
+                    if single_worker_cli:
+                        progress(downloaded, recording.expected_size, speed)
+
+                if now - state_time >= STATE_REFRESH:
+                    store.worker_progress(
+                        worker,
+                        downloaded,
+                        recording.expected_size,
+                        speed,
+                    )
+                    state_time = now
+
+                if not single_worker_cli and now - log_time >= MULTI_LOG_REFRESH:
+                    percent = (
+                        min(100, downloaded * 100 / recording.expected_size)
+                        if recording.expected_size
+                        else 0
+                    )
+                    line(
+                        f"[{worker}] {percent:5.1f}% "
+                        f"{format_size(downloaded)} / {format_size(recording.expected_size)} "
+                        f"{format_speed(speed)} {recording.recording_name}"
+                    )
+                    log_time = now
+
+    store.worker_progress(worker, downloaded, recording.expected_size, speed)
+    if single_worker_cli:
+        progress(downloaded, recording.expected_size, speed, final=True)
+    return downloaded
+
+
+def download_one(store, run_id, recording, cfg, single_worker_cli):
     worker = threading.current_thread().name
-    path = target_path(recording, root)
+    path = target_path(recording, cfg["recordings"])
     part = Path(f"{path}.part")
 
     try:
@@ -283,7 +430,7 @@ def download_one(store, run_id, recording, root, single_worker_cli):
                 line(f"{RED}--- ERROR: {message} ---{RESET}")
                 return Result(failed=1)
 
-            ok, message = delete_remote(recording)
+            ok, message = delete_remote(recording, cfg["request_timeout"])
             if ok:
                 store.mark_completed(
                     recording.local_id,
@@ -300,66 +447,45 @@ def download_one(store, run_id, recording, root, single_worker_cli):
             line(f"{RED}--- ERROR: {message} ---{RESET}")
             return Result(failed=1)
 
-        if part.exists():
-            part.unlink()
-
         store.begin_download(recording.local_id)
         store.worker_start(worker, run_id, recording.local_id, recording.expected_size)
 
-        downloaded = 0
-        speed = 0.0
-        speed_time = state_time = log_time = time.monotonic()
-        speed_bytes = 0
+        last_error = None
+        for attempt in range(cfg["download_retry"]):
+            if attempt > 0:
+                backoff = cfg["download_backoff"][attempt]
+                if backoff > 0:
+                    line(
+                        f"[{worker}] Retry {attempt}/{cfg['download_retry'] - 1} "
+                        f"for {recording.recording_name}; waiting {backoff}s"
+                    )
+                    time.sleep(backoff)
 
-        if single_worker_cli:
-            progress(0, recording.expected_size, 0)
-
-        with requests.get(
-            recording.recording_url,
-            stream=True,
-            timeout=DOWNLOAD_TIMEOUT,
-        ) as response:
-            response.raise_for_status()
-            with open(part, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.monotonic()
-
-                    if now - speed_time >= CLI_REFRESH:
-                        elapsed = now - speed_time
-                        speed = (downloaded - speed_bytes) / elapsed
-                        speed_time, speed_bytes = now, downloaded
-                        if single_worker_cli:
-                            progress(downloaded, recording.expected_size, speed)
-
-                    if now - state_time >= STATE_REFRESH:
-                        store.worker_progress(
-                            worker,
-                            downloaded,
-                            recording.expected_size,
-                            speed,
-                        )
-                        state_time = now
-
-                    if not single_worker_cli and now - log_time >= MULTI_LOG_REFRESH:
-                        percent = (
-                            min(100, downloaded * 100 / recording.expected_size)
-                            if recording.expected_size
-                            else 0
-                        )
-                        line(
-                            f"[{worker}] {percent:5.1f}% "
-                            f"{format_size(downloaded)} / {format_size(recording.expected_size)} "
-                            f"{format_speed(speed)} {recording.recording_name}"
-                        )
-                        log_time = now
-
-        store.worker_progress(worker, downloaded, recording.expected_size, speed)
-        if single_worker_cli:
-            progress(downloaded, recording.expected_size, speed, final=True)
+            try:
+                _download_attempt(
+                    store,
+                    worker,
+                    recording,
+                    part,
+                    cfg,
+                    single_worker_cli,
+                )
+                last_error = None
+                break
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                line(
+                    f"{YELLOW}[{worker}] Download attempt {attempt + 1}/"
+                    f"{cfg['download_retry']} failed: {exc}{RESET}"
+                )
+        else:
+            message = (
+                f"Download failed after {cfg['download_retry']} attempts: {last_error}. "
+                "Will retry on a later cycle."
+            )
+            store.mark_retryable(recording.local_id, message)
+            line(f"{RED}--- ERROR: {message} ---{RESET}")
+            return Result(failed=1)
 
         actual_size = part.stat().st_size
         if actual_size != recording.expected_size:
@@ -375,7 +501,7 @@ def download_one(store, run_id, recording, root, single_worker_cli):
 
         os.replace(part, path)
         line(f"{GREEN}Download Completed{RESET}")
-        ok, message = delete_remote(recording)
+        ok, message = delete_remote(recording, cfg["request_timeout"])
         if ok:
             store.mark_completed(recording.local_id, str(path))
             line(f"{GREEN}Record Deleted{RESET}")
@@ -385,11 +511,6 @@ def download_one(store, run_id, recording, root, single_worker_cli):
         line(f"{RED}--- ERROR: {message} ---{RESET}")
         return Result(downloaded=1, failed=1)
 
-    except requests.RequestException as exc:
-        message = f"Download failed: {exc}. Will retry on a later cycle."
-        store.mark_retryable(recording.local_id, message)
-        line(f"{RED}--- ERROR: {message} ---{RESET}")
-        return Result(failed=1)
     except OSError as exc:
         message = (
             f"Local filesystem error: {exc}. "
@@ -415,89 +536,100 @@ def download_one(store, run_id, recording, root, single_worker_cli):
             line(f"{RED}--- ERROR: worker cleanup failed: {exc} ---{RESET}")
 
 
-def run_cycle(store, run_id, cfg):
-    found = failed = 0
+def recording_worker_limit(cfg, account_name):
+    return cfg["recording_workers_per_account"].get(
+        account_name,
+        cfg["recording_workers_default"],
+    )
+
+
+def process_account(store, run_id, cfg, number, apikey, account_name):
+    headers = {"X-Api-Key": apikey}
+    account_id = store.ensure_account(account_name)
+    line()
+    line("=" * 70)
+    line(f"Account {number}: {account_name}")
+    line("Connecting to ClickMeeting API...")
+
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/conferences/recordings",
+            headers=headers,
+            timeout=cfg["request_timeout"],
+        )
+        response.raise_for_status()
+        raw_recordings = response.json()
+        if not isinstance(raw_recordings, list):
+            raise ValueError("recordings response is not a list")
+    except (requests.RequestException, ValueError) as exc:
+        line(f"{RED}--- ERROR: API request failed for {account_name}: {exc} ---{RESET}")
+        return AccountResult(failed=1)
+
+    found = len(raw_recordings)
+    failed = downloaded = 0
+    line(f"status code={response.status_code} (ok) for account: {account_name}")
+    line(f"Recordings found: {found}")
+    remote_ids = {
+        str(item["id"])
+        for item in raw_recordings
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    store.reconcile_account(account_id, remote_ids)
+
     queue = []
-
-    for number, (apikey, account_name) in enumerate(cfg["accounts"], start=1):
-        headers = {"X-Api-Key": apikey}
-        account_id = store.ensure_account(account_name)
-        line()
-        line("=" * 70)
-        line(f"Account {number}: {account_name}")
-        line("Connecting to ClickMeeting API...")
-
+    for raw in raw_recordings:
         try:
-            response = requests.get(
-                f"{API_BASE_URL}/conferences/recordings",
-                headers=headers,
-                timeout=API_TIMEOUT,
-            )
-            response.raise_for_status()
-            raw_recordings = response.json()
-            if not isinstance(raw_recordings, list):
-                raise ValueError("recordings response is not a list")
-        except (requests.RequestException, ValueError) as exc:
-            line(f"{RED}--- ERROR: API request failed for {account_name}: {exc} ---{RESET}")
+            recording = parse_recording(raw, account_name, headers, account_id, store)
+        except (KeyError, TypeError, ValueError) as exc:
+            line(f"{RED}--- ERROR: invalid recording metadata: {exc} ---{RESET}")
             failed += 1
             continue
 
-        found += len(raw_recordings)
-        line(f"status code={response.status_code} (ok) for account: {account_name}")
-        line(f"Recordings found: {len(raw_recordings)}")
-        remote_ids = {
-            str(item["id"])
-            for item in raw_recordings
-            if isinstance(item, dict) and item.get("id") is not None
-        }
-        store.reconcile_account(account_id, remote_ids)
-
-        for raw in raw_recordings:
-            try:
-                recording = parse_recording(raw, account_name, headers, account_id, store)
-            except (KeyError, TypeError, ValueError) as exc:
-                line(f"{RED}--- ERROR: invalid recording metadata: {exc} ---{RESET}")
-                failed += 1
-                continue
-
-            if recording.current_status == "QUARANTINED":
-                line(f"Skipping quarantined: {recording.recording_name}")
-            elif recording.current_status == "DELETE_FAILED":
-                failed += retry_delete(store, recording)
-            elif recording.current_status in {
-                "COMPLETED",
-                "COMPLETED_MANUAL_DELETE",
-                "RESOLVED_EXTERNALLY",
-            }:
-                line(
-                    f"Skipping resolved: {recording.recording_name} "
-                    f"({recording.current_status})"
-                )
-            elif recording.current_status in {"NEW", "RETRYABLE_ERROR", "DOWNLOADING"}:
-                queue.append(recording)
-            else:
-                line(
-                    f"Skipping unsupported state {recording.current_status}: "
-                    f"{recording.recording_name}"
-                )
+        if recording.current_status == "QUARANTINED":
+            line(f"Skipping quarantined: {recording.recording_name}")
+        elif recording.current_status == "DELETE_FAILED":
+            failed += retry_delete(store, recording, cfg)
+        elif recording.current_status in {
+            "COMPLETED",
+            "COMPLETED_MANUAL_DELETE",
+            "RESOLVED_EXTERNALLY",
+        }:
+            line(
+                f"Skipping resolved: {recording.recording_name} "
+                f"({recording.current_status})"
+            )
+        elif recording.current_status in {"NEW", "RETRYABLE_ERROR", "DOWNLOADING"}:
+            queue.append(recording)
+        else:
+            line(
+                f"Skipping unsupported state {recording.current_status}: "
+                f"{recording.recording_name}"
+            )
 
     if not queue:
-        line("No recordings queued for download.")
-        return found, 0, failed
+        line(f"[{account_name}] No recordings queued for download.")
+        return AccountResult(found=found, failed=failed)
 
-    workers = min(cfg["workers"], len(queue))
-    line(f"Download queue: {len(queue)}, worker limit: {workers}")
-    downloaded = 0
-    single_worker_cli = workers == 1 and sys.stdout.isatty()
+    workers = min(recording_worker_limit(cfg, account_name), len(queue))
+    line(
+        f"[{account_name}] Download queue: {len(queue)}, "
+        f"recording worker limit: {workers}"
+    )
+    single_worker_cli = (
+        cfg["account_workers"] == 1
+        and workers == 1
+        and sys.stdout.isatty()
+    )
+    prefix = f"recording-{sanitize_filename(account_name)}"
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="worker") as pool:
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix) as pool:
         futures = [
             pool.submit(
                 download_one,
                 store,
                 run_id,
                 recording,
-                cfg["recordings"],
+                cfg,
                 single_worker_cli,
             )
             for recording in queue
@@ -509,6 +641,46 @@ def run_cycle(store, run_id, cfg):
                 line(f"{RED}--- ERROR: worker crashed: {exc} ---{RESET}")
                 failed += 1
                 continue
+            downloaded += result.downloaded
+            failed += result.failed
+
+    return AccountResult(found=found, downloaded=downloaded, failed=failed)
+
+
+def run_cycle(store, run_id, cfg):
+    found = downloaded = failed = 0
+    account_workers = min(cfg["account_workers"], len(cfg["accounts"]))
+    line(f"Account worker limit: {account_workers}")
+
+    with ThreadPoolExecutor(
+        max_workers=account_workers,
+        thread_name_prefix="account",
+    ) as pool:
+        futures = {
+            pool.submit(
+                process_account,
+                store,
+                run_id,
+                cfg,
+                number,
+                apikey,
+                account_name,
+            ): account_name
+            for number, (apikey, account_name) in enumerate(cfg["accounts"], start=1)
+        }
+
+        for future in as_completed(futures):
+            account_name = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                line(
+                    f"{RED}--- ERROR: account worker crashed for "
+                    f"{account_name}: {exc} ---{RESET}"
+                )
+                failed += 1
+                continue
+            found += result.found
             downloaded += result.downloaded
             failed += result.failed
 
@@ -569,8 +741,35 @@ def main():
             line(f"Configured accounts: {len(cfg['accounts'])}")
             line(f"State database: {store.database_path}")
             line(f"Recordings directory: {Path(cfg['recordings']).resolve()}")
-            line(f"Download workers: {cfg['workers']}")
+            line(f"Account workers: {cfg['account_workers']}")
+            line(
+                f"Recording workers default: {cfg['recording_workers_default']}"
+            )
+            if cfg["recording_workers_per_account"]:
+                line(
+                    "Recording workers per account: "
+                    + ", ".join(
+                        f"{name}={workers}"
+                        for name, workers in sorted(
+                            cfg["recording_workers_per_account"].items()
+                        )
+                    )
+                )
+            line(
+                "Request timeout: "
+                f"connect={cfg['request_timeout'][0]}s, "
+                f"read={cfg['request_timeout'][1]}s"
+            )
+            line(
+                f"Download retry: {cfg['download_retry']} attempts, "
+                f"backoff={cfg['download_backoff']}"
+            )
             line(f"Run interval: {cfg['interval']}s")
+            if cfg["legacy_download_limit"] > 0:
+                line(
+                    "Legacy download_limit is intentionally not used: "
+                    "small recordings are downloaded and verified before remote deletion."
+                )
 
             heartbeat = threading.Thread(
                 target=heartbeat_loop,
