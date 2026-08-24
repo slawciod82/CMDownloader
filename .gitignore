@@ -1,0 +1,8 @@
+app_cfg.py
+__pycache__/
+*.pyc
+state/
+*.db
+*.db-*
+*.part
+.env
