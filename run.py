@@ -868,20 +868,28 @@ def download_manager_loop(store, cfg, stop_event):
     account_keys = {name: key for key, name in cfg["accounts"]}
     cap = cfg["download_worker_cap"]
     with ThreadPoolExecutor(max_workers=cap, thread_name_prefix="download") as pool:
-        active = set()
+        active = {}
         while not stop_event.is_set() or active:
-            done = {future for future in active if future.done()}
+            done = [future for future in active if future.done()]
             for future in done:
                 try:
                     future.result()
                 except Exception as exc:
                     line(f"Download worker crashed: {exc}")
-            active -= done
+                del active[future]
             while not stop_event.is_set() and len(active) < cap:
-                item = store.claim_job()
+                counts = {}
+                for name in active.values():
+                    counts[name] = counts.get(name, 0) + 1
+                excluded = {
+                    name for name, count in counts.items()
+                    if count >= recording_worker_limit(cfg, name)
+                }
+                item = store.claim_job(excluded)
                 if item is None:
                     break
-                active.add(pool.submit(_run_job, store, item, cfg, account_keys))
+                future = pool.submit(_run_job, store, item, cfg, account_keys)
+                active[future] = item["account_name"]
             stop_event.wait(0.5)
 
 
@@ -914,8 +922,13 @@ def scheduler_loop(store, cfg, once):
                 )
                 store.finish_run(run_id, found, 0, failed, next_run)
             if once:
-                # --once is an inventory-only run; queued downloads are retained.
-                return
+                # Preserve the CLI's one-cycle behavior: finish currently due jobs.
+                account_keys = {name: key for key, name in cfg["accounts"]}
+                while True:
+                    item = store.claim_job()
+                    if item is None:
+                        return
+                    _run_job(store, item, cfg, account_keys)
             remaining = max(0, cfg["interval"] - (time.monotonic() - start))
             time.sleep(remaining)
     finally:
