@@ -468,16 +468,19 @@ class StateStore:
             ))
             return True
 
-    def claim_job(self):
+    def claim_job(self, excluded_accounts: set[str] | None = None):
         """Claim under a local lock; one process owns the state database."""
         now = utc_now_naive()
         with self._lock, self.Session.begin() as session:
-            job = session.scalar(
-                select(DownloadJob)
+            query = (
+                select(DownloadJob).join(Recording, DownloadJob.recording_id == Recording.id)
+                .join(Account, Recording.account_id == Account.id)
                 .where(DownloadJob.status.in_(["QUEUED", "RETRY_WAIT"]),
                        DownloadJob.next_attempt_at <= now)
-                .order_by(DownloadJob.created_at, DownloadJob.id).limit(1)
             )
+            if excluded_accounts:
+                query = query.where(Account.name.not_in(excluded_accounts))
+            job = session.scalar(query.order_by(DownloadJob.created_at, DownloadJob.id).limit(1))
             if job is None:
                 return None
             rec = session.get(Recording, job.recording_id)
