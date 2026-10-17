@@ -454,7 +454,8 @@ class StateStore:
         with self._lock, self.Session() as session:
             rows = session.scalars(select(Recording).where(
                 Recording.id != recording_pk,
-                Recording.recorded_at == recorded_at,
+                Recording.recorded_at >= recorded_at - timedelta(hours=3),
+                Recording.recorded_at <= recorded_at + timedelta(hours=3),
             )).all()
             return [(row.id, row.recording_name, row.local_path) for row in rows]
 
