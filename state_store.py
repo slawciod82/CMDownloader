@@ -449,7 +449,7 @@ class StateStore:
         with self._lock, self.Session.begin() as session:
             row = session.scalar(select(DownloadJob).where(DownloadJob.recording_id == recording_pk))
             if row:
-                if row.status in {"QUEUED", "RUNNING", "RETRY_WAIT"}:
+                if row.status in {"QUEUED", "RUNNING", "RETRY_WAIT", "FAILED"}:
                     return False
                 recording = session.get(Recording, recording_pk)
                 if not recording or recording.status in {"COMPLETED", "QUARANTINED", "COMPLETED_MANUAL_DELETE", "RESOLVED_EXTERNALLY"}:
@@ -512,6 +512,9 @@ class StateStore:
                 job.status = "COMPLETED"
                 job.finished_at = now
             elif rec and rec.status in {"QUARANTINED"}:
+                job.status = "FAILED"
+                job.finished_at = now
+            elif job.attempt_count >= 16:
                 job.status = "FAILED"
                 job.finished_at = now
             else:
