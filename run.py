@@ -234,6 +234,7 @@ def config():
         "download_backoff": download_backoff,
         "download_limit": download_limit,
         "account_workers": min(account_workers, len(apikeys)),
+        "download_worker_cap": download_worker_cap or recording_workers_default,
         "recording_workers_default": recording_workers_default,
         "recording_workers_per_account": recording_workers_per_account,
     }
@@ -766,179 +767,174 @@ def recording_worker_limit(cfg, account_name):
     )
 
 
-def process_account(store, run_id, cfg, number, apikey, account_name):
+
+def discover_account(store, run_id, cfg, number, apikey, account_name):
+    """Discovery only: record remote inventory and enqueue work."""
     headers = {"X-Api-Key": apikey}
     account_id = store.ensure_account(account_name)
-    line()
-    line("=" * 70)
-    line(f"Account {number}: {account_name}")
-    line("Connecting to ClickMeeting API...")
-
     try:
-        raw_recordings, discovery_mode = discover_recordings(
-            headers,
-            cfg,
-            account_name,
-        )
+        raw_recordings, mode = discover_recordings(headers, cfg, account_name)
     except (requests.RequestException, ValueError) as exc:
-        line(f"{RED}--- ERROR: API request failed for {account_name}: {exc} ---{RESET}")
+        line(f"[{account_name}] Discovery failed: {exc}")
         return AccountResult(failed=1)
-
-    found = len(raw_recordings)
-    failed = downloaded = 0
-    line(f"[{account_name}] Recordings found: {found} ({discovery_mode})")
     remote_ids = {
-        str(item["id"])
-        for item in raw_recordings
+        str(item["id"]) for item in raw_recordings
         if isinstance(item, dict) and item.get("id") is not None
     }
     store.reconcile_account(account_id, remote_ids)
-
-    queue = []
+    failed = 0
     for raw in raw_recordings:
         try:
             recording = parse_recording(raw, account_name, headers, account_id, store)
-        except (KeyError, TypeError, ValueError) as exc:
-            line(f"{RED}--- ERROR: invalid recording metadata: {exc} ---{RESET}")
+        except (KeyError, ValueError, TypeError) as exc:
+            line(f"[{account_name}] Invalid recording: {exc}")
             failed += 1
             continue
-
-        if recording.current_status == "QUARANTINED":
-            line(f"Skipping quarantined: {recording.recording_name}")
-        elif recording.current_status == "DELETE_FAILED":
-            failed += retry_delete(store, recording, cfg)
-        elif recording.current_status in {
-            "COMPLETED",
-            "COMPLETED_MANUAL_DELETE",
-            "RESOLVED_EXTERNALLY",
+        if recording.current_status in {
+            "COMPLETED", "COMPLETED_MANUAL_DELETE", "RESOLVED_EXTERNALLY", "QUARANTINED",
         }:
-            line(
-                f"Skipping resolved: {recording.recording_name} "
-                f"({recording.current_status})"
-            )
-        elif (
-            cfg["download_limit"] > 0
-            and recording.expected_size <= cfg["download_limit"]
-        ):
-            failed += discard_short_recording(store, recording, cfg)
+            continue
+        if recording.current_status == "DELETE_FAILED":
+            operation = "DELETE"
+        elif cfg["download_limit"] > 0 and recording.expected_size <= cfg["download_limit"]:
+            operation = "DISCARD"
         elif recording.current_status in {"NEW", "RETRYABLE_ERROR", "DOWNLOADING"}:
-            queue.append(recording)
+            operation = "DOWNLOAD"
         else:
-            line(
-                f"Skipping unsupported state {recording.current_status}: "
-                f"{recording.recording_name}"
-            )
+            continue
+        store.enqueue_job(recording.local_id, run_id, operation)
+    line(f"[{account_name}] Discovery {mode}: {len(raw_recordings)} recordings")
+    return AccountResult(found=len(raw_recordings), failed=failed)
 
-    if not queue:
-        line(f"[{account_name}] No recordings queued for download.")
-        return AccountResult(found=found, failed=failed)
 
-    workers = min(recording_worker_limit(cfg, account_name), len(queue))
-    line(
-        f"[{account_name}] Download queue: {len(queue)}, "
-        f"recording worker limit: {workers}"
-    )
-    single_worker_cli = (
-        cfg["account_workers"] == 1
-        and workers == 1
-        and sys.stdout.isatty()
-    )
-    prefix = f"recording-{sanitize_filename(account_name)}"
-
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix) as pool:
+def discovery_cycle(store, run_id, cfg):
+    found = failed = 0
+    with ThreadPoolExecutor(
+        max_workers=cfg["account_workers"], thread_name_prefix="discovery"
+    ) as pool:
         futures = [
-            pool.submit(
-                download_one,
-                store,
-                run_id,
-                recording,
-                cfg,
-                single_worker_cli,
-            )
-            for recording in queue
+            pool.submit(discover_account, store, run_id, cfg, n, key, name)
+            for n, (key, name) in enumerate(cfg["accounts"], start=1)
         ]
         for future in as_completed(futures):
             try:
                 result = future.result()
+                found += result.found
+                failed += result.failed
             except Exception as exc:
-                line(f"{RED}--- ERROR: worker crashed: {exc} ---{RESET}")
+                line(f"Discovery worker failed: {exc}")
                 failed += 1
-                continue
-            downloaded += result.downloaded
-            failed += result.failed
-
-    return AccountResult(found=found, downloaded=downloaded, failed=failed)
+    return found, failed
 
 
-def run_cycle(store, run_id, cfg):
-    found = downloaded = failed = 0
-    account_workers = min(cfg["account_workers"], len(cfg["accounts"]))
-    line(f"Account worker limit: {account_workers}")
+def _run_job(store, item, cfg, account_keys):
+    key = account_keys.get(item["account_name"])
+    if not key:
+        store.finish_job(item["job_id"], True, "Missing account credentials")
+        return
+    started = item["recorded_at"].replace(tzinfo=timezone.utc).astimezone(LOCAL_TIMEZONE)
+    recording = RemoteRecording(
+        local_id=item["recording_pk"],
+        account_name=item["account_name"],
+        headers={"X-Api-Key": key},
+        recording_id=item["recording_id"],
+        conference_id=item["conference_id"],
+        recording_url="",
+        recording_name=item["recording_name"],
+        local_started=started,
+        expected_size=item["expected_size"],
+        current_status=item["status"],
+        resolution=item["resolution"],
+    )
+    failed = False
+    error = None
+    try:
+        if item["operation"] == "DELETE":
+            failed = bool(retry_delete(store, recording, cfg))
+        elif item["operation"] == "DISCARD":
+            failed = bool(discard_short_recording(store, recording, cfg))
+        else:
+            result = download_one(store, item["run_id"], recording, cfg, False)
+            failed = bool(result.failed)
+    except Exception as exc:
+        failed = True
+        error = str(exc)
+        line(f"Job {item['job_id']} failed: {error}")
+    finally:
+        store.finish_job(item["job_id"], failed, error)
 
-    with ThreadPoolExecutor(
-        max_workers=account_workers,
-        thread_name_prefix="account",
-    ) as pool:
-        futures = {
-            pool.submit(
-                process_account,
-                store,
-                run_id,
-                cfg,
-                number,
-                apikey,
-                account_name,
-            ): account_name
-            for number, (apikey, account_name) in enumerate(cfg["accounts"], start=1)
-        }
 
-        for future in as_completed(futures):
-            account_name = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                line(
-                    f"{RED}--- ERROR: account worker crashed for "
-                    f"{account_name}: {exc} ---{RESET}"
-                )
-                failed += 1
-                continue
-            found += result.found
-            downloaded += result.downloaded
-            failed += result.failed
-
-    return found, downloaded, failed
+def download_manager_loop(store, cfg, stop_event):
+    account_keys = {name: key for key, name in cfg["accounts"]}
+    cap = cfg["download_worker_cap"]
+    with ThreadPoolExecutor(max_workers=cap, thread_name_prefix="download") as pool:
+        active = {}
+        while not stop_event.is_set() or active:
+            done = [future for future in active if future.done()]
+            for future in done:
+                try:
+                    future.result()
+                except Exception as exc:
+                    line(f"Download worker crashed: {exc}")
+                del active[future]
+            while not stop_event.is_set() and len(active) < cap:
+                counts = {}
+                for name in active.values():
+                    counts[name] = counts.get(name, 0) + 1
+                excluded = {
+                    name for name, count in counts.items()
+                    if count >= recording_worker_limit(cfg, name)
+                }
+                item = store.claim_job(excluded)
+                if item is None:
+                    break
+                future = pool.submit(_run_job, store, item, cfg, account_keys)
+                active[future] = item["account_name"]
+            stop_event.wait(0.5)
 
 
 def scheduler_loop(store, cfg, once):
-    while True:
-        run_id = store.start_run()
-        line()
-        line("=" * 70)
-        line(f"Run {run_id} started at {datetime.now(LOCAL_TIMEZONE).isoformat()}")
-
-        try:
-            found, downloaded, failed = run_cycle(store, run_id, cfg)
-        except Exception as exc:
-            next_run = None if once else utc_now_naive() + timedelta(seconds=cfg["interval"])
-            store.fail_run(run_id, next_run)
-            line(f"{RED}--- ERROR: run {run_id} failed: {exc} ---{RESET}")
+    """Periodic inventory, never blocked by downloads."""
+    stop_downloads = threading.Event()
+    manager = None
+    if not once:
+        manager = threading.Thread(
+            target=download_manager_loop, args=(store, cfg, stop_downloads),
+            name="download-manager", daemon=False,
+        )
+        manager.start()
+    try:
+        while True:
+            start = time.monotonic()
+            run_id = store.start_run()
+            try:
+                found, failed = discovery_cycle(store, run_id, cfg)
+            except Exception as exc:
+                line(f"Discovery run {run_id} failed: {exc}")
+                failed = 1
+                found = 0
+                store.fail_run(
+                    run_id, None if once else utc_now_naive() + timedelta(seconds=cfg["interval"])
+                )
+            else:
+                next_run = None if once else utc_now_naive() + timedelta(
+                    seconds=max(0, cfg["interval"] - (time.monotonic() - start))
+                )
+                store.finish_run(run_id, found, 0, failed, next_run)
             if once:
-                raise
-        else:
-            next_run = None if once else utc_now_naive() + timedelta(seconds=cfg["interval"])
-            status = store.finish_run(run_id, found, downloaded, failed, next_run)
-            line(
-                f"Run {run_id} finished: {status}. "
-                f"Found: {found}, downloaded: {downloaded}, problems: {failed}."
-            )
-
-        if once:
-            return
-
-        line(f"Waiting {cfg['interval']}s before the next ClickMeeting check.")
-        time.sleep(cfg["interval"])
-
+                # Preserve the CLI's one-cycle behavior: finish currently due jobs.
+                account_keys = {name: key for key, name in cfg["accounts"]}
+                while True:
+                    item = store.claim_job()
+                    if item is None:
+                        return
+                    _run_job(store, item, cfg, account_keys)
+            remaining = max(0, cfg["interval"] - (time.monotonic() - start))
+            time.sleep(remaining)
+    finally:
+        stop_downloads.set()
+        if manager is not None:
+            manager.join()
 
 def main():
     args = parse_args()
@@ -988,6 +984,7 @@ def main():
                 f"backoff={cfg['download_backoff']}"
             )
             line(f"Run interval: {cfg['interval']}s")
+            line(f"Global download worker cap: {cfg['download_worker_cap']}")
             if cfg["download_limit"] > 0:
                 line(
                     "Short-recording discard threshold: "
