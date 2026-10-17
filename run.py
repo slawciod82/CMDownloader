@@ -913,7 +913,7 @@ def scheduler_loop(store, cfg, once):
                 line(f"Discovery run {run_id} failed: {exc}")
                 failed = 1
                 found = 0
-                status = store.fail_run(
+                store.fail_run(
                     run_id, None if once else utc_now_naive() + timedelta(seconds=cfg["interval"])
                 )
             else:
@@ -984,6 +984,7 @@ def main():
                 f"backoff={cfg['download_backoff']}"
             )
             line(f"Run interval: {cfg['interval']}s")
+            line(f"Global download worker cap: {cfg['download_worker_cap']}")
             if cfg["download_limit"] > 0:
                 line(
                     "Short-recording discard threshold: "
