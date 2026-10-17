@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
 
 from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import sessionmaker
 
-from models import Account, Base, Event, Recording, Run, RuntimeWorker, SchedulerState
+from models import Account, Base, DownloadJob, Event, Recording, Run, RuntimeWorker, SchedulerState
 
 
 def utc_now_naive() -> datetime:
@@ -43,6 +43,11 @@ class StateStore:
             else:
                 scheduler.interval_seconds = interval_seconds
                 scheduler.heartbeat_at = now
+            # The exclusive process lock makes startup recovery safe.
+            for job in session.scalars(select(DownloadJob).where(DownloadJob.status == "RUNNING")):
+                job.status = "QUEUED"
+                job.started_at = None
+                job.next_attempt_at = now
             session.execute(delete(RuntimeWorker))
 
     def touch_heartbeat(self) -> None:
@@ -64,7 +69,6 @@ class StateStore:
             scheduler.current_run_id = run.id
             scheduler.next_run_at = None
             scheduler.heartbeat_at = now
-            session.execute(delete(RuntimeWorker))
             return run.id
 
     def finish_run(
@@ -92,7 +96,6 @@ class StateStore:
                 scheduler.current_run_id = None
                 scheduler.next_run_at = next_run_at
                 scheduler.heartbeat_at = now
-            session.execute(delete(RuntimeWorker))
         return status
 
     def fail_run(self, run_id: int, next_run_at: datetime | None) -> None:
@@ -109,8 +112,7 @@ class StateStore:
                 scheduler.current_run_id = None
                 scheduler.next_run_at = next_run_at
                 scheduler.heartbeat_at = now
-            session.execute(delete(RuntimeWorker))
-
+ 
     def ensure_account(self, name: str) -> int:
         with self._lock, self.Session.begin() as session:
             account = session.scalar(select(Account).where(Account.name == name))
@@ -440,3 +442,76 @@ class StateStore:
                     created_at=now,
                 )
             )
+
+    def enqueue_job(self, recording_pk: int, run_id: int, operation: str) -> bool:
+        """Add once; never reset an active task on rediscovery."""
+        now = utc_now_naive()
+        with self._lock, self.Session.begin() as session:
+            row = session.scalar(select(DownloadJob).where(DownloadJob.recording_id == recording_pk))
+            if row:
+                if row.status in {"QUEUED", "RUNNING", "RETRY_WAIT"}:
+                    return False
+                recording = session.get(Recording, recording_pk)
+                if not recording or recording.status in {"COMPLETED", "QUARANTINED", "COMPLETED_MANUAL_DELETE", "RESOLVED_EXTERNALLY"}:
+                    return False
+                row.operation = operation
+                row.status = "QUEUED"
+                row.next_attempt_at = now
+                row.discovered_run_id = run_id
+                row.finished_at = None
+                row.last_error = None
+                return True
+            session.add(DownloadJob(
+                recording_id=recording_pk, discovered_run_id=run_id,
+                operation=operation, status="QUEUED", created_at=now,
+                next_attempt_at=now, attempt_count=0,
+            ))
+            return True
+
+    def claim_job(self):
+        """Claim under a local lock; one process owns the state database."""
+        now = utc_now_naive()
+        with self._lock, self.Session.begin() as session:
+            job = session.scalar(
+                select(DownloadJob)
+                .where(DownloadJob.status.in_(["QUEUED", "RETRY_WAIT"]),
+                       DownloadJob.next_attempt_at <= now)
+                .order_by(DownloadJob.created_at, DownloadJob.id).limit(1)
+            )
+            if job is None:
+                return None
+            rec = session.get(Recording, job.recording_id)
+            if rec is None or rec.status in {"COMPLETED", "QUARANTINED", "COMPLETED_MANUAL_DELETE", "RESOLVED_EXTERNALLY"}:
+                job.status = "COMPLETED"
+                job.finished_at = now
+                return None
+            account = session.get(Account, rec.account_id)
+            job.status = "RUNNING"
+            job.started_at = now
+            job.attempt_count += 1
+            return {
+                "job_id": job.id, "run_id": job.discovered_run_id,
+                "recording_pk": rec.id, "account_name": account.name,
+                "recording_id": rec.recording_id, "conference_id": rec.conference_id,
+                "recording_name": rec.recording_name, "recorded_at": rec.recorded_at,
+                "expected_size": rec.expected_size, "status": rec.status,
+                "resolution": rec.resolution, "operation": job.operation,
+            }
+
+    def finish_job(self, job_id: int, failed: bool, error: str | None = None, retry_seconds: int = 300) -> None:
+        now = utc_now_naive()
+        with self._lock, self.Session.begin() as session:
+            job = session.get(DownloadJob, job_id)
+            if job is None:
+                return
+            rec = session.get(Recording, job.recording_id)
+            if not failed or (rec and rec.status in {"COMPLETED", "COMPLETED_MANUAL_DELETE", "RESOLVED_EXTERNALLY"}):
+                job.status = "COMPLETED"
+                job.finished_at = now
+            elif rec and rec.status in {"QUARANTINED"}:
+                job.status = "FAILED"
+                job.finished_at = now
+            else:
+                job.status = "RETRY_WAIT"
+                job.next_attempt_at = now + timedelta(seconds=retry_seconds)
+            job.last_error = error
