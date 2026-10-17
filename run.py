@@ -568,11 +568,12 @@ def verify_delete_retry_copy(recording, recordings_root):
 def recording_target_collision(store, recording, path):
     """A filename/time collision cannot establish remote recording identity."""
     utc_start = recording.local_started.astimezone(timezone.utc).replace(tzinfo=None)
-    for other_id, other_name, other_path in store.get_colliding_recordings(recording.local_id, utc_start):
+    for other_id, other_name, other_started, other_path in store.get_colliding_recordings(recording.local_id, utc_start):
+        other_local = other_started.replace(tzinfo=timezone.utc).astimezone(LOCAL_TIMEZONE)
         other_filename = (
             f"{sanitize_filename(other_name)} "
-            f"{recording.local_started.strftime('%Y-%m-%d')} "
-            f"{recording.local_started.strftime('%H_%M_%S')}.mp4"
+            f"{other_local.strftime('%Y-%m-%d')} "
+            f"{other_local.strftime('%H_%M_%S')}.mp4"
         )
         if other_filename == path.name or (other_path and Path(other_path) == path):
             return f"Target path collision with recording #{other_id}; manual review required"
