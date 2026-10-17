@@ -77,6 +77,13 @@ class CollisionTests(unittest.TestCase):
             store = SimpleNamespace(get_colliding_recordings=lambda pk, timestamp: [(11, "Lecture", recording.local_started.replace(tzinfo=None), None)])
             self.assertIn("#11", recording_target_collision(store, recording, path))
 
+    def test_same_name_at_different_time_is_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recording, path = sample_recording(Path(directory))
+            other_started = recording.local_started.replace(tzinfo=None).replace(minute=46)
+            store = SimpleNamespace(get_colliding_recordings=lambda pk, timestamp: [(11, "Lecture", other_started, None)])
+            self.assertIsNone(recording_target_collision(store, recording, path))
+
     def test_different_name_is_allowed(self):
         with tempfile.TemporaryDirectory() as directory:
             recording, path = sample_recording(Path(directory))
