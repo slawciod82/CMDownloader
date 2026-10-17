@@ -449,7 +449,7 @@ class StateStore:
             row = session.get(Recording, recording_pk)
             return row.last_error if row else "Recording is missing"
 
-    def get_colliding_recordings(self, recording_pk: int, recorded_at: datetime) -> list[tuple[int, str, str | None]]:
+    def get_colliding_recordings(self, recording_pk: int, recorded_at: datetime) -> list[tuple[int, str, datetime, str | None]]:
         """Potential path collisions must be checked across accounts too."""
         with self._lock, self.Session() as session:
             rows = session.scalars(select(Recording).where(
@@ -457,7 +457,7 @@ class StateStore:
                 Recording.recorded_at >= recorded_at - timedelta(hours=3),
                 Recording.recorded_at <= recorded_at + timedelta(hours=3),
             )).all()
-            return [(row.id, row.recording_name, row.local_path) for row in rows]
+            return [(row.id, row.recording_name, row.recorded_at, row.local_path) for row in rows]
 
     def enqueue_job(self, recording_pk: int, run_id: int, operation: str) -> bool:
         """Add once; never reset an active task on rediscovery."""
