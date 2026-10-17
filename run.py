@@ -49,6 +49,7 @@ class RemoteRecording:
     expected_size: int
     current_status: str
     resolution: str | None
+    local_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -470,6 +471,7 @@ def parse_recording(raw, account_name, headers, account_id, store):
         expected_size=size,
         current_status=row["status"],
         resolution=row["resolution"],
+        local_path=row["local_path"],
     )
 
 
@@ -539,6 +541,44 @@ def discard_short_recording(store, recording, cfg):
     return 1
 
 
+def verify_delete_retry_copy(recording, recordings_root):
+    """Fail closed unless the previously verified local copy still exists."""
+    if not recording.local_path:
+        return "DELETE blocked: missing recorded local_path"
+    root = Path(recordings_root).resolve()
+    expected_path = target_path(recording, root)
+    saved_path = Path(recording.local_path)
+    if saved_path.is_symlink() or expected_path.is_symlink():
+        return "DELETE blocked: symbolic link at local recording path"
+    if saved_path.resolve() != expected_path.resolve():
+        return "DELETE blocked: local_path differs from canonical recording path"
+    if not expected_path.resolve().is_relative_to(root):
+        return "DELETE blocked: local_path is outside recordings root"
+    try:
+        if not expected_path.is_file():
+            return "DELETE blocked: verified local file is missing"
+        size = expected_path.stat().st_size
+    except OSError as exc:
+        return f"DELETE blocked: cannot inspect local recording: {exc}"
+    if size != recording.expected_size:
+        return f"DELETE blocked: local size mismatch (expected {recording.expected_size}, got {size})"
+    return None
+
+
+def recording_target_collision(store, recording, path):
+    """A filename/time collision cannot establish remote recording identity."""
+    utc_start = recording.local_started.astimezone(timezone.utc).replace(tzinfo=None)
+    for other_id, other_name, other_path in store.get_colliding_recordings(recording.local_id, utc_start):
+        other_filename = (
+            f"{sanitize_filename(other_name)} "
+            f"{recording.local_started.strftime('%Y-%m-%d')} "
+            f"{recording.local_started.strftime('%H_%M_%S')}.mp4"
+        )
+        if other_filename == path.name or (other_path and Path(other_path) == path):
+            return f"Target path collision with recording #{other_id}; manual review required"
+    return None
+
+
 def retry_delete(store, recording, cfg):
     short_discard = recording.resolution == "discarded_short_recording"
     action = (
@@ -547,6 +587,12 @@ def retry_delete(store, recording, cfg):
         else "Retrying remote delete without redownload"
     )
     line(f"{action}: {recording.account_name} / {recording.recording_name}")
+    if not short_discard:
+        reason = verify_delete_retry_copy(recording, cfg["recordings"])
+        if reason:
+            store.mark_quarantined(recording.local_id, reason)
+            line(f"{RED}--- ERROR: {reason} ---{RESET}")
+            return 1
     ok, message = delete_remote(recording, cfg["request_timeout"])
     if ok:
         if short_discard:
@@ -635,6 +681,11 @@ def download_one(store, run_id, recording, cfg, single_worker_cli):
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        collision = recording_target_collision(store, recording, path)
+        if collision:
+            store.mark_quarantined(recording.local_id, collision)
+            line(f"{RED}--- ERROR: {collision} ---{RESET}")
+            return Result(failed=1)
 
         line()
         line("-" * 70)
@@ -845,6 +896,7 @@ def _run_job(store, item, cfg, account_keys):
         expected_size=item["expected_size"],
         current_status=item["status"],
         resolution=item["resolution"],
+        local_path=item["local_path"],
     )
     failed = False
     error = None
@@ -861,6 +913,8 @@ def _run_job(store, item, cfg, account_keys):
         error = str(exc)
         line(f"Job {item['job_id']} failed: {error}")
     finally:
+        if failed and not error:
+            error = store.get_recording_error(item["recording_pk"]) or "Job failed without recording error"
         store.finish_job(item["job_id"], failed, error)
 
 
@@ -905,6 +959,8 @@ def scheduler_loop(store, cfg, once):
         manager.start()
     try:
         while True:
+            if manager is not None and not manager.is_alive():
+                raise RuntimeError("Download manager stopped unexpectedly; restarting downloader process")
             start = time.monotonic()
             run_id = store.start_run()
             try:
@@ -930,7 +986,12 @@ def scheduler_loop(store, cfg, once):
                         return
                     _run_job(store, item, cfg, account_keys)
             remaining = max(0, cfg["interval"] - (time.monotonic() - start))
-            time.sleep(remaining)
+            # Detect a dead manager promptly even between 300-second discovery cycles.
+            until = time.monotonic() + remaining
+            while time.monotonic() < until:
+                if manager is not None and not manager.is_alive():
+                    raise RuntimeError("Download manager stopped unexpectedly; restarting downloader process")
+                time.sleep(min(1.0, until - time.monotonic()))
     finally:
         stop_downloads.set()
         if manager is not None:
