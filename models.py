@@ -33,6 +33,7 @@ class Recording(Base):
     attention_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     resolution: Mapped[str | None] = mapped_column(String(40), nullable=True)
     expected_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
