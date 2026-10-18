@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
 
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import create_engine, delete, select, inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from models import Account, Base, DownloadJob, Event, Recording, Run, RuntimeWorker, SchedulerState
@@ -27,6 +27,7 @@ class StateStore:
         self._lock = threading.Lock()
 
     def initialize(self, interval_seconds: int) -> None:
+        self.ensure_duration_schema()
         Base.metadata.create_all(self.engine)
         now = utc_now_naive()
         with self._lock, self.Session.begin() as session:
@@ -49,6 +50,23 @@ class StateStore:
                 job.started_at = None
                 job.next_attempt_at = now
             session.execute(delete(RuntimeWorker))
+
+    def ensure_duration_schema(self) -> None:
+        """SQLite create_all does not add columns to existing production tables."""
+        if "recordings" not in inspect(self.engine).get_table_names():
+            Base.metadata.create_all(self.engine)
+            return
+        if "duration_seconds" not in {col["name"] for col in inspect(self.engine).get_columns("recordings")}:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE recordings ADD COLUMN duration_seconds INTEGER"))
+
+    def set_recording_duration(self, recording_pk: int, duration_seconds: int) -> None:
+        if duration_seconds < 0:
+            raise ValueError("Duration cannot be negative")
+        with self._lock, self.Session.begin() as session:
+            row = session.get(Recording, recording_pk)
+            if row is not None:
+                row.duration_seconds = duration_seconds
 
     def touch_heartbeat(self) -> None:
         with self._lock, self.Session.begin() as session:
