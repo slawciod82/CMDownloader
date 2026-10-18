@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -675,6 +678,31 @@ def _download_attempt(store, worker, recording, part, cfg, single_worker_cli):
     return downloaded
 
 
+def probe_duration_seconds(path):
+    """Read MP4 container metadata without decoding or altering the file."""
+    try:
+        process = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=45, check=True,
+        )
+        raw = json.loads(process.stdout)["format"]["duration"]
+        seconds = float(raw)
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return round(seconds)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_probe_duration(store, recording_pk, path):
+    duration = probe_duration_seconds(path)
+    if duration is not None:
+        store.set_recording_duration(recording_pk, duration)
+    else:
+        line(f"Duration unavailable from ffprobe: {path}")
+
+
 def download_one(store, run_id, recording, cfg, single_worker_cli):
     worker = threading.current_thread().name
     path = target_path(recording, cfg["recordings"])
@@ -706,6 +734,7 @@ def download_one(store, run_id, recording, cfg, single_worker_cli):
                 line(f"{RED}--- ERROR: {message} ---{RESET}")
                 return Result(failed=1)
 
+            save_probe_duration(store, recording.local_id, path)
             ok, message = delete_remote(recording, cfg["request_timeout"])
             if ok:
                 store.mark_completed(
@@ -776,6 +805,7 @@ def download_one(store, run_id, recording, cfg, single_worker_cli):
             return Result(failed=1)
 
         os.replace(part, path)
+        save_probe_duration(store, recording.local_id, path)
         line(f"{GREEN}Download Completed{RESET}")
         ok, message = delete_remote(recording, cfg["request_timeout"])
         if ok:
